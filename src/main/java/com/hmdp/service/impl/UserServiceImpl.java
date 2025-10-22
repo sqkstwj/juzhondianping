@@ -68,47 +68,134 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
 
     @Override
     public Result login(LoginFormDTO loginForm, HttpSession session) {
-        //校验手机号
+        // 1. 校验手机号
         String phone = loginForm.getPhone();
         if(RegexUtils.isPhoneInvalid(phone)) {
-            //如果不符合，返回错误
             return Result.fail("号码格式错误！");
         }
-        // 从redis校验验证码
-
-        String  cacheCode = stringRedisTemplate.opsForValue().get(LOGIN_CODE_KEY + phone);
+        
+        // 2. 判断登录方式：验证码登录 or 密码登录
         String code = loginForm.getCode();
-        if(cacheCode == null || !cacheCode.equals(code)){
-        //不一致，报错
-            return Result.fail("验证码错误");
+        String password = loginForm.getPassword();
+        
+        User user;
+        
+        // 2.1 验证码登录（优先）
+        if (StrUtil.isNotBlank(code)) {
+            log.debug("使用验证码登录，手机号: {}", phone);
+            user = loginByCode(phone, code);
+            if (user == null) {
+                return Result.fail("验证码错误");
+            }
+        } 
+        // 2.2 密码登录
+        else if (StrUtil.isNotBlank(password)) {
+            log.debug("使用密码登录，手机号: {}", phone);
+            user = loginByPassword(phone, password);
+            if (user == null) {
+                return Result.fail("手机号或密码错误");
+            }
+        } 
+        // 2.3 两者都没有
+        else {
+            return Result.fail("请输入验证码或密码");
         }
-
-        //一致根据手机号查询用户
-        User user = query().eq("phone",phone).one();
-        //判断用户是否存在
-        if(user == null){
-            //不存在就创建用户并保存
+        
+        // 3. 生成token并保存到Redis
+        return generateTokenAndSave(user);
+    }
+    
+    /**
+     * 验证码登录
+     * 
+     * @param phone 手机号
+     * @param code 验证码
+     * @return 用户对象，验证失败返回null
+     */
+    private User loginByCode(String phone, String code) {
+        // 1. 从Redis获取验证码
+        String cacheCode = stringRedisTemplate.opsForValue().get(LOGIN_CODE_KEY + phone);
+        
+        // 2. 验证码不存在或不匹配
+        if (cacheCode == null || !cacheCode.equals(code)) {
+            log.warn("验证码错误，phone: {}, 输入code: {}, 缓存code: {}", phone, code, cacheCode);
+            return null;
+        }
+        
+        // 3. 验证码正确，查询或创建用户
+        User user = query().eq("phone", phone).one();
+        if (user == null) {
+            // 不存在就创建用户（注册）
             user = createUserWithPhone(phone);
+            log.info("新用户注册，phone: {}, userId: {}", phone, user.getId());
         }
-
-        //存在就直接保存到redis中
-        //生成一个token,作为登录令牌
+        
+        // 4. 删除验证码，防止重复使用
+        stringRedisTemplate.delete(LOGIN_CODE_KEY + phone);
+        
+        return user;
+    }
+    
+    /**
+     * 密码登录
+     * 
+     * @param phone 手机号
+     * @param password 明文密码
+     * @return 用户对象，验证失败返回null
+     */
+    private User loginByPassword(String phone, String password) {
+        // 1. 查询用户
+        User user = query().eq("phone", phone).one();
+        
+        // 2. 用户不存在
+        if (user == null) {
+            log.warn("用户不存在，phone: {}", phone);
+            return null;
+        }
+        
+        // 3. 用户未设置密码
+        if (StrUtil.isBlank(user.getPassword())) {
+            log.warn("用户未设置密码，phone: {}, userId: {}", phone, user.getId());
+            return null;
+        }
+        
+        // 4. 验证密码
+        if (!com.hmdp.utils.PasswordEncoder.matches(user.getPassword(), password)) {
+            log.warn("密码错误，phone: {}, userId: {}", phone, user.getId());
+            return null;
+        }
+        
+        log.info("密码登录成功，phone: {}, userId: {}", phone, user.getId());
+        return user;
+    }
+    
+    /**
+     * 生成Token并保存用户信息到Redis
+     * 
+     * @param user 用户对象
+     * @return Result包含token
+     */
+    private Result generateTokenAndSave(User user) {
+        // 1. 生成token
         String token = UUID.randomUUID().toString(true);
-        //将User对象转化为Hash存储
-        UserDTO userDTO = BeanUtil.copyProperties(user,UserDTO.class);
-        Map<String , Object> userMap = BeanUtil.beanToMap(userDTO,new HashMap<>(),
+        
+        // 2. 将User对象转为UserDTO（不包含敏感信息）
+        UserDTO userDTO = BeanUtil.copyProperties(user, UserDTO.class);
+        
+        // 3. 转为Map存储
+        Map<String, Object> userMap = BeanUtil.beanToMap(userDTO, new HashMap<>(),
                 CopyOptions.create()
                         .setIgnoreNullValue(true)
                         .setFieldValueEditor((fieldName, fieldValue) -> fieldValue.toString()));
-        //存储
-        stringRedisTemplate.opsForHash().putAll(LOGIN_USER_KEY + token,userMap);
-
-        //设置token有效期
-        stringRedisTemplate.expire(LOGIN_USER_KEY+token, LOGIN_USER_TTL, TimeUnit.MINUTES);
         
-        //登录成功后删除验证码，防止重复使用
-        stringRedisTemplate.delete(LOGIN_CODE_KEY + phone);
-
+        // 4. 保存到Redis
+        String key = LOGIN_USER_KEY + token;
+        stringRedisTemplate.opsForHash().putAll(key, userMap);
+        
+        // 5. 设置过期时间
+        stringRedisTemplate.expire(key, LOGIN_USER_TTL, TimeUnit.MINUTES);
+        
+        log.info("用户登录成功，token: {}, userId: {}", token, user.getId());
         return Result.ok(token);
     }
 
@@ -131,6 +218,42 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         return Result.ok("登出成功");
     }
 
+    @Override
+    public Result setPassword(String phone, String code, String password) {
+        // 1. 校验手机号
+        if (RegexUtils.isPhoneInvalid(phone)) {
+            return Result.fail("号码格式错误！");
+        }
+        
+        // 2. 校验密码格式（6-20位）
+        if (StrUtil.isBlank(password) || password.length() < 6 || password.length() > 20) {
+            return Result.fail("密码长度必须为6-20位！");
+        }
+        
+        // 3. 校验验证码
+        String cacheCode = stringRedisTemplate.opsForValue().get(LOGIN_CODE_KEY + phone);
+        if (cacheCode == null || !cacheCode.equals(code)) {
+            return Result.fail("验证码错误");
+        }
+        
+        // 4. 查询用户
+        User user = query().eq("phone", phone).one();
+        if (user == null) {
+            return Result.fail("用户不存在，请先注册");
+        }
+        
+        // 5. 加密密码并保存
+        String encodedPassword = com.hmdp.utils.PasswordEncoder.encode(password);
+        user.setPassword(encodedPassword);
+        updateById(user);
+        
+        // 6. 删除验证码
+        stringRedisTemplate.delete(LOGIN_CODE_KEY + phone);
+        
+        log.info("用户设置密码成功，phone: {}, userId: {}", phone, user.getId());
+        return Result.ok("密码设置成功");
+    }
+    
     private User createUserWithPhone(String phone){
         User user = new User();
         user.setPhone(phone);

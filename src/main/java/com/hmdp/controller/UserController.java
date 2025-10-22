@@ -83,4 +83,19 @@ public class UserController {
         // 返回
         return Result.ok(info);
     }
+    
+    /**
+     * 设置/修改密码
+     * 
+     * @param phone 手机号
+     * @param code 验证码
+     * @param password 新密码
+     * @return 操作结果
+     */
+    @PostMapping("/password")
+    public Result setPassword(@RequestParam("phone") String phone,
+                               @RequestParam("code") String code,
+                               @RequestParam("password") String password) {
+        return userService.setPassword(phone, code, password);
+    }
 }
