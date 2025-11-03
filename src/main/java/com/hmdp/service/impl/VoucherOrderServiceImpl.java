@@ -8,9 +8,11 @@ import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.SimpleRedisLockV2;
 import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.aop.framework.AopContext;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -34,6 +36,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     
     @Resource
     private RedisIdWorker redisIdWorker;
+    
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
     
     /**
      * 秒杀优惠券
@@ -78,21 +83,39 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return Result.fail("库存不足！");
         }
         
-        // 4. 一人一单逻辑
+        // 4. 一人一单逻辑（使用分布式锁）
         // 获取当前登录用户ID
         Long userId = UserHolder.getUser().getId();
         
-        // 使用用户ID作为锁对象，确保同一个用户的多个请求串行执行
-        // 为什么要用 toString().intern()？
-        // - toString() 会创建新的String对象，每次都不同
-        // - intern() 会返回字符串常量池中的对象，相同内容的字符串返回同一个对象
-        // - 这样同一个用户ID就会使用同一把锁
-        synchronized (userId.toString().intern()) {
+        // 创建分布式锁对象
+        // 锁的粒度：使用 userId 作为锁名称的一部分
+        // 这样不同用户之间不会互相阻塞，只有同一个用户的多个请求会串行执行
+        SimpleRedisLockV2 lock = new SimpleRedisLockV2("order:" + userId, stringRedisTemplate);
+        
+        // 尝试获取锁
+        // 参数：锁的超时时间（10秒）
+        // 为什么需要超时时间？
+        // - 防止死锁：如果获取锁的线程挂了，锁会自动过期释放
+        // - 超时时间要大于业务执行时间，否则业务还没执行完锁就过期了
+        boolean isLock = lock.tryLock(10);
+        
+        // 判断是否获取锁成功
+        if (!isLock) {
+            // 获取锁失败，说明当前用户有其他请求正在执行
+            // 这种情况一般是用户重复点击导致的
+            return Result.fail("不允许重复下单！");
+        }
+        
+        try {
             // 获取代理对象（因为Spring事务是基于代理实现的）
             // 如果直接调用 this.createVoucherOrder()，事务不会生效
             // 因为 this 是当前对象，不是Spring的代理对象
             IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
             return proxy.createVoucherOrder(voucherId);
+        } finally {
+            // 释放锁
+            // 注意：必须在 finally 块中释放，保证锁一定会被释放
+            lock.unlock();
         }
     }
     
