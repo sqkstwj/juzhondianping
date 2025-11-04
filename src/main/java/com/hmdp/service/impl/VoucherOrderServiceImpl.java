@@ -11,6 +11,8 @@ import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.SimpleRedisLockV2;
 import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.AopContext;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -39,6 +41,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     
     @Resource
     private StringRedisTemplate stringRedisTemplate;
+
+    @Resource
+    private RedissonClient redissonClient;
     
     /**
      * 秒杀优惠券
@@ -90,14 +95,18 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         // 创建分布式锁对象
         // 锁的粒度：使用 userId 作为锁名称的一部分
         // 这样不同用户之间不会互相阻塞，只有同一个用户的多个请求会串行执行
-        SimpleRedisLockV2 lock = new SimpleRedisLockV2("order:" + userId, stringRedisTemplate);
+
+        //SimpleRedisLockV2 lock = new SimpleRedisLockV2("order:" + userId, stringRedisTemplate);
+
+        // 使用Redisson分布式锁
+        RLock lock = redissonClient.getLock("lock:order:" + userId);
         
         // 尝试获取锁
-        // 参数：锁的超时时间（10秒）
-        // 为什么需要超时时间？
-        // - 防止死锁：如果获取锁的线程挂了，锁会自动过期释放
-        // - 超时时间要大于业务执行时间，否则业务还没执行完锁就过期了
-        boolean isLock = lock.tryLock(10);
+        // tryLock() 不传参数：
+        // - 不等待，立即返回（非阻塞）
+        // - 使用默认的看门狗机制（30秒过期，自动续期）
+        // - 可重入锁，同一线程可多次获取
+        boolean isLock = lock.tryLock();
         
         // 判断是否获取锁成功
         if (!isLock) {
@@ -114,8 +123,13 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return proxy.createVoucherOrder(voucherId);
         } finally {
             // 释放锁
-            // 注意：必须在 finally 块中释放，保证锁一定会被释放
-            lock.unlock();
+            // 注意：
+            // 1. 必须在 finally 块中释放，保证锁一定会被释放
+            // 2. 必须判断是否是当前线程持有的锁，避免释放别人的锁
+            // 3. Redisson的unlock()如果锁不是当前线程持有会抛异常
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
     }
     
